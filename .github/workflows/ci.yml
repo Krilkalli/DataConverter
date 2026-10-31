@@ -1,0 +1,131 @@
+name: DataConverter CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    name: Build and test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out source code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # GitHub-hosted runners already contain CMake and native C++ compilers.
+      # FetchContent installs the pinned yaml-cpp and GoogleTest during configure.
+      - name: Show build tools
+        run: |
+          cmake --version
+          ctest --version
+
+      # Cache only dependency source trees. Build trees and CMakeCache.txt
+      # contain machine-specific paths and must be recreated on each runner.
+      - name: Restore dependency sources
+        id: deps
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            build/_deps/yaml-cpp-src
+            build/_deps/googletest-src
+          key: ${{ runner.os }}-${{ runner.arch }}-fetchcontent-v1-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Configure CMake and install dependencies
+        id: configure
+        env:
+          CACHE_HIT: ${{ steps.deps.outputs.cache-hit }}
+        run: |
+          start=$SECONDS
+          args=(-S . -B build -DCMAKE_BUILD_TYPE=Release -DDATACONV_BUILD_TESTS=ON)
+          if [[ "$CACHE_HIT" == "true" ]]; then
+            args+=("-DFETCHCONTENT_SOURCE_DIR_YAML-CPP=$GITHUB_WORKSPACE/build/_deps/yaml-cpp-src")
+            args+=("-DFETCHCONTENT_SOURCE_DIR_GOOGLETEST=$GITHUB_WORKSPACE/build/_deps/googletest-src")
+          fi
+          cmake "${args[@]}" 2>&1 | tee ci-configure.log
+          echo "seconds=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+
+      - name: Build application and tests
+        id: build
+        run: |
+          start=$SECONDS
+          cmake --build build --config Release --parallel 4 2>&1 | tee ci-build.log
+          echo "seconds=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+
+      - name: Run all tests
+        id: tests
+        run: |
+          start=$SECONDS
+          set +e
+          ctest --test-dir build -C Release --output-on-failure --no-tests=error \
+            --output-junit test-results.xml 2>&1 | tee ci-tests.log
+          result=${PIPESTATUS[0]}
+          set -e
+          echo "seconds=$((SECONDS - start))" >> "$GITHUB_OUTPUT"
+          exit "$result"
+
+      - name: Write job summary
+        if: ${{ always() }}
+        env:
+          OS: ${{ matrix.os }}
+          CACHE_HIT: ${{ steps.deps.outputs.cache-hit }}
+          CONFIGURE_SECONDS: ${{ steps.configure.outputs.seconds }}
+          BUILD_SECONDS: ${{ steps.build.outputs.seconds }}
+          TEST_SECONDS: ${{ steps.tests.outputs.seconds }}
+          CONFIGURE_RESULT: ${{ steps.configure.outcome }}
+          BUILD_RESULT: ${{ steps.build.outcome }}
+          TEST_RESULT: ${{ steps.tests.outcome }}
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## $OS
+          | Metric | Value |
+          | --- | --- |
+          | Dependency cache hit | ${CACHE_HIT:-false} |
+          | Configure | $CONFIGURE_RESULT (${CONFIGURE_SECONDS:-n/a} s) |
+          | Build | $BUILD_RESULT (${BUILD_SECONDS:-n/a} s) |
+          | Tests | $TEST_RESULT (${TEST_SECONDS:-n/a} s) |
+
+          Cache stores dependency sources; the project and dependencies are compiled again.
+          EOF
+
+      - name: Upload test report and logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            build/test-results.xml
+            build/Testing/Temporary/LastTest.log
+            ci-configure.log
+            ci-build.log
+            ci-tests.log
+          if-no-files-found: warn
+          retention-days: 30
+
+  ci-result:
+    name: CI result
+    needs: build-test
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all matrix jobs to pass
+        env:
+          MATRIX_RESULT: ${{ needs.build-test.result }}
+        run: |
+          echo "Matrix result: $MATRIX_RESULT" >> "$GITHUB_STEP_SUMMARY"
+          test "$MATRIX_RESULT" = success
