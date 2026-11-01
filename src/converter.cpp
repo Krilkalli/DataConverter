@@ -214,6 +214,7 @@ std::string to_yaml(const json& value) {
 
 }  // namespace
 
+// Convert between CSV, JSON and YAML without accessing files.
 std::string convert_text(const std::string& input,
                          const std::string& input_extension,
                          const std::string& output_extension) {
